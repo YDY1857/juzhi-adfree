@@ -22,15 +22,21 @@ jobs:
             -miphoneos-version-min=13.0 \
             -isysroot "$SDK" \
             -dynamiclib \
-            -O2 \
-            -Wl,-flat_namespace \
+            -O2 -Wall \
+            -lobjc \
+            -framework Foundation \
             -Wl,-undefined,dynamic_lookup \
             -install_name @executable_path/Frameworks/AdFree.dylib \
             -o AdFree.dylib AdFree.c
           echo "----- build ok -----"
           ls -l AdFree.dylib
           file AdFree.dylib
+          echo "----- header -----"
           xcrun --sdk iphoneos otool -hv AdFree.dylib | head -6
+          echo "----- dependencies -----"
+          xcrun --sdk iphoneos otool -L AdFree.dylib
+          echo "----- init funcs -----"
+          xcrun --sdk iphoneos otool -s __DATA __mod_init_func AdFree.dylib | head -10
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
