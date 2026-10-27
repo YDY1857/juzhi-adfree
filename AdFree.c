@@ -1,19 +1,10 @@
 /*
- * AdFree.c — 橘汁影视 去广告注入库 (arm64 / iOS)
+ * AdFree.c — 橘汁影视 去广告注入库  【侦察版 / 只处理开屏】
  *
- * 目标 App 是 Flutter 壳，广告由自研原生插件 ZCBundleGarrisonSaddle 直连
- * 穿山甲 (CSJ / GroMore-ABU) 展示，共 4 类：
- *   开屏   -> CSJSplashAd / BUSplashAd        delegate: splashAdLoadFail:error:
- *   信息流 -> *NativeAdsManager               delegate: nativeAdsManager:didFailWithError:
- *   插屏   -> *ExpressFullscreenVideoAd       delegate: nativeExpressFullscreenVideoAd:didFailWithError:
- *   激励   -> *ExpressRewardedVideoAd         delegate: nativeExpressRewardedVideoAd:didFailWithError:
+ * 这一版的目的：让库自己上报它活到了哪一步。
+ * 日志写到沙盒 Documents/adfree.log，安装后必读。
  *
- * 做法：把 SDK 的 load* 入口短路，并异步投递一次「无填充」失败回调，
- * 等价于线上真实的广告无填充场景，App 自己的容错逻辑会照常往下走，
- * 因此不会白屏、不会卡开屏；show* 入口一律吞掉，任何广告 UI 都不出现。
- *
- * 不依赖 CydiaSubstrate，纯 ObjC runtime；不做 include，
- * 全部符号运行时解析，因此也能在 Windows 上用 zig 交叉编译验证。
+ * 编译：标准链接（libobjc + Foundation），不再依赖已废弃的 flat namespace。
  */
 
 typedef void *id_t;
@@ -33,11 +24,55 @@ extern void free(void *p);
 extern int strncmp(const char *a, const char *b, unsigned long n);
 extern char *strstr(const char *h, const char *n);
 extern unsigned long strlen(const char *s);
+extern char *strcpy(char *d, const char *s);
+extern char *strcat(char *d, const char *s);
+extern int sprintf(char *buf, const char *fmt, ...);
+extern char *getenv(const char *name);
+extern int open(const char *path, int flags, ...);
+extern long write(int fd, const void *buf, unsigned long n);
+extern int close(int fd);
 extern void dispatch_async_f(void *queue, void *ctx, void (*fn)(void *));
 extern void *dispatch_get_main_queue(void);
+extern unsigned long long dispatch_time(unsigned long long when, long long delta);
+extern void dispatch_after_f(unsigned long long when, void *q, void *ctx, void (*fn)(void *));
 
 #define S(x) sel_registerName(x)
+#define O_WRONLY 0x0001
+#define O_CREAT  0x0200
+#define O_APPEND 0x0008
 
+/* ---------------- 日志 ---------------- */
+static char g_logpath[512];
+
+static void log_init(void) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    strcpy(g_logpath, home);
+    strcat(g_logpath, "/Documents/adfree.log");
+}
+
+static void mark(const char *s) {
+    if (!g_logpath[0]) return;
+    int fd = open(g_logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    write(fd, s, strlen(s));
+    write(fd, "\n", 1);
+    close(fd);
+}
+
+static void markf(const char *fmt, int a) {
+    char b[256];
+    sprintf(b, fmt, a);
+    mark(b);
+}
+
+static void marks(const char *tag, const char *v) {
+    char b[256];
+    sprintf(b, "%s%s", tag, v ? v : "(null)");
+    mark(b);
+}
+
+/* ---------------- 运行时辅助 ---------------- */
 static void *msg0(void *o, const char *sel) {
     return ((void *(*)(void *, void *))objc_msgSend)(o, S(sel));
 }
@@ -52,7 +87,6 @@ static void call2(void *o, const char *sel, void *a, void *b) {
     ((void (*)(void *, void *, void *, void *))objc_msgSend)(o, S(sel), a, b);
 }
 
-/* 构造 NSError，供失败回调使用 */
 static void *make_error(void) {
     void *nsstr = objc_getClass("NSString");
     void *nserr = objc_getClass("NSError");
@@ -63,158 +97,135 @@ static void *make_error(void) {
         nserr, S("errorWithDomain:code:userInfo:"), domain, -1L, 0);
 }
 
-/* 按类名挑对应的失败回调（顺序即优先级） */
+/* ---------------- 只处理开屏 ---------------- */
 static void notify_fail(void *obj) {
     void *dg = msg0(obj, "delegate");
-    if (!dg) return;
-
     const char *cn = class_getName(object_getClass(obj));
-    if (!cn) return;
-
-    const char *cand[4] = {0, 0, 0, 0};
-    if (strstr(cn, "Splash")) {
-        cand[0] = "splashAdLoadFail:error:";
-        cand[1] = "splashAd:didFailWithError:";
-    } else if (strstr(cn, "NativeAdsManager") || strstr(cn, "NativeAdManager")) {
-        cand[0] = "nativeAdsManager:didFailWithError:";
-        cand[1] = "nativeAdManager:didFailWithError:";
-    } else if (strstr(cn, "ExpressFullscreenVideoAd") ||
-               (strstr(cn, "FullscreenVideoAd") && !strstr(cn, "Rewarded"))) {
-        cand[0] = "nativeExpressFullscreenVideoAd:didFailWithError:";
-        cand[1] = "fullscreenVideoAd:didFailWithError:";
-    } else if (strstr(cn, "ExpressRewardedVideoAd") || strstr(cn, "RewardedVideoAd")) {
-        cand[0] = "nativeExpressRewardedVideoAd:didFailWithError:";
-        cand[1] = "rewardedVideoAd:didFailWithError:";
-    } else if (strstr(cn, "Interstitial")) {
-        cand[0] = "interstitialAd:didFailWithError:";
-        cand[1] = "nativeExpressInterstitialAd:didFailWithError:";
-    } else if (strstr(cn, "Banner")) {
-        cand[0] = "nativeExpressBannerAdView:didLoadFailWithError:";
-        cand[1] = "bannerAdView:didFailWithError:";
-    } else {
-        return;
-    }
+    marks("F class=", cn);
+    if (!dg) { mark("F  no-delegate"); return; }
 
     void *err = make_error();
-    for (int i = 0; i < 4; i++) {
-        if (!cand[i]) continue;
-        if (responds(dg, cand[i])) {
-            call2(dg, cand[i], obj, err);
+    const char *cands[3] = {
+        "splashAdLoadFail:error:",
+        "splashAd:didFailWithError:",
+        0
+    };
+    for (int i = 0; cands[i]; i++) {
+        if (responds(dg, cands[i])) {
+            marks("F  call=", cands[i]);
+            call2(dg, cands[i], obj, err);
             return;
         }
     }
+    mark("F  no-delegate-method");
 }
 
-/* 异步工作：对象保活 -> 投递失败回调 -> 释放 */
 static void fail_worker(void *ctx) {
     void *obj = ctx;
     notify_fail(obj);
     msg0(obj, "release");
+    mark("F  worker-done");
 }
 
-/* 替换实现：load* 一律短路并回报失败；show* 一律吞掉 */
 static long imp_load(void *self, void *cmd) {
     (void)cmd;
+    mark("L load-called");
     msg0(self, "retain");
     dispatch_async_f(dispatch_get_main_queue(), self, fail_worker);
     return 0;
 }
+
 static long imp_show(void *self, void *cmd) {
     (void)self; (void)cmd;
+    mark("W show-blocked");
     return 0;
 }
 
 static const char *kLoadSels[] = {
-    "loadAdData",
-    "loadAdDataWithCount:",
-    "loadAdDataWithCompletionHandler:",
-    "loadSplashAdWithSlotID:andParameter:",
-    "loadFullScreenAd",
-    "loadHalfScreenAd",
-    "loadAdAndShow",
-    0
+    "loadAdData", "loadAdDataWithCount:", "loadAdDataWithCompletionHandler:",
+    "loadSplashAdWithSlotID:andParameter:", "loadFullScreenAd", "loadHalfScreenAd", 0
 };
-
 static const char *kShowSels[] = {
-    "showAdFromRootViewController:",
-    "showAdFromRootViewController:extraInfos:",
-    "showAdFromRootViewController:extroInfos:",
-    "showAdFromRootViewController:ritScene:ritSceneDescribe:",
-    "showAdFromRootViewController:ritSceneDescribe:",
-    "showInWindow:",
-    "showInWindowWithBlock:",
-    "showAdInWindow:withBottomView:skipView:",
-    "showFromRootViewController:",
-    0
+    "showInWindow:", "showInWindowWithBlock:", "showAdFromRootViewController:",
+    "showAdInWindow:withBottomView:skipView:", 0
 };
 
-/* 只处理广告 SDK 的类，避开 App 自身混淆过的 ZC* 类 */
-static int is_ad_class(const char *n) {
-    static const char *pfx[] = {"BU", "CSJ", "ABU", "GM", "GDT", "KS", "TT", "BD", 0};
+static int is_splash_class(const char *n) {
+    static const char *pfx[] = {"BU", "CSJ", "ABU", "GM", "GDT", "KS", 0};
     int ok = 0;
-    for (int i = 0; pfx[i]; i++) {
+    for (int i = 0; pfx[i]; i++)
         if (strncmp(n, pfx[i], strlen(pfx[i])) == 0) { ok = 1; break; }
-    }
     if (!ok) return 0;
-
-    static const char *mk[] = {
-        "SplashAd", "NativeAdsManager", "NativeAdManager",
-        "ExpressFullscreenVideoAd", "ExpressRewardedVideoAd",
-        "FullscreenVideoAd", "RewardedVideoAd", "InterstitialAd",
-        "NativeExpressBannerView", "BannerAd", "ABUBaseAd",
-        "NativeExpressAdManager", "DrawAdsManager",
-        0
-    };
-    for (int i = 0; mk[i]; i++) if (strstr(n, mk[i])) return 1;
-    return 0;
+    return strstr(n, "SplashAd") != 0;
 }
 
-static void hook_method_list(void *cls) {
-    if (!cls) return;
+static int hook_list(void *cls) {
+    int n = 0;
+    if (!cls) return 0;
     unsigned int cnt = 0;
     void **ms = class_copyMethodList(cls, &cnt);
-    if (!ms) return;
+    if (!ms) return 0;
     for (unsigned int i = 0; i < cnt; i++) {
         void *m = ms[i];
         const char *sn = sel_getName(method_getName(m));
         if (!sn) continue;
-
-        void *target = 0;
-        for (int k = 0; kLoadSels[k]; k++) {
-            if (strstr(sn, kLoadSels[k])) { target = (void *)imp_load; break; }
-        }
-        if (!target) {
-            for (int k = 0; kShowSels[k]; k++) {
-                if (strstr(sn, kShowSels[k])) { target = (void *)imp_show; break; }
-            }
-        }
-        if (!target) continue;
-        if (method_getImplementation(m) == target) continue;
-        method_setImplementation(m, target);
+        void *t = 0;
+        for (int k = 0; kLoadSels[k]; k++)
+            if (strstr(sn, kLoadSels[k])) { t = (void *)imp_load; break; }
+        if (!t)
+            for (int k = 0; kShowSels[k]; k++)
+                if (strstr(sn, kShowSels[k])) { t = (void *)imp_show; break; }
+        if (!t) continue;
+        if (method_getImplementation(m) == t) continue;
+        method_setImplementation(m, t);
+        n++;
     }
     free(ms);
+    return n;
 }
 
-static void hook_all(void) {
+/* ---------------- 入口 ---------------- */
+__attribute__((constructor)) static void adfree_init(void) {
+    log_init();
+    mark("=== S0 constructor ===");
+    marks("HOME=", getenv("HOME"));
+
+    const char *probe[] = {
+        "CSJSplashAd", "BUSplashAd", "ABUSplashAd", "GMSplashAd",
+        "BUNativeAdsManager", "BUNativeExpressFullscreenVideoAd",
+        "BUNativeExpressRewardedVideoAd", "ZCBundleGarrisonSaddle", 0
+    };
+    for (int i = 0; probe[i]; i++) {
+        void *c = objc_getClass(probe[i]);
+        marks(c ? "probe OK   " : "probe MISS ", probe[i]);
+    }
+
+    int total = objc_getClassList(0, 0);
+    markf("S1 classes=%d", total);
+
     static void *buf[16384];
-    int n = objc_getClassList(0, 0);
-    if (n <= 0) return;
-    if (n > 16384) n = 16384;
-    n = objc_getClassList(buf, n);
+    int n = objc_getClassList(buf, total > 16384 ? 16384 : total);
+    int matched = 0, hooked = 0;
     for (int i = 0; i < n; i++) {
         void *cls = buf[i];
         const char *cn = class_getName(cls);
-        if (!cn || !is_ad_class(cn)) continue;
-        hook_method_list(cls);            /* 实例方法 */
-        hook_method_list(object_getClass(cls)); /* 类方法（metaclass） */
+        if (!cn || !is_splash_class(cn)) continue;
+        matched++;
+        marks("S2 splash-class: ", cn);
+        hooked += hook_list(cls);
+        hooked += hook_list(object_getClass(cls));
     }
+    markf("S2 matched=%d", matched);
+    markf("S2 hooked=%d", hooked);
+    mark("=== S3 init done ===");
 }
 
-__attribute__((constructor)) static void adfree_init(void) {
-    hook_all();
+static void alive_check(void *ctx) {
+    (void)ctx;
+    mark("S4 alive (still running)");
 }
 
-/* 兜底：再扫一遍，捕获延迟注册/延迟 dlopen 的类 */
-__attribute__((constructor(201))) static void adfree_init_late(void) {
-    hook_all();
+__attribute__((constructor(201))) static void adfree_late(void) {
+    /* 1 秒后再打个点，证明进程没死在初始化阶段 */
+    dispatch_after_f(dispatch_time(0, 1000000000LL), dispatch_get_main_queue(), 0, alive_check);
 }
